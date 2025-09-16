@@ -1,21 +1,19 @@
-# app.py
+# app.py — Email-only storage (resume + optional cover letter attachments)
 import os
 import re
-import csv
 import time
-import pathlib
 import smtplib
+import mimetypes
 from datetime import datetime
 from email.message import EmailMessage
-from typing import Optional
+from typing import Optional, List, Tuple
 
 import streamlit as st
 
 # =============================
-# Configuration & Secrets
+# Config & Secrets
 # =============================
 def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
-    """Prefer Streamlit secrets, then env var, then default."""
     try:
         val = st.secrets.get(key, None)
     except Exception:
@@ -23,19 +21,15 @@ def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     return val if val is not None else os.getenv(key, default)
 
 APP_TITLE = get_secret("APP_TITLE", "Job Application Portal")
-HR_EMAIL = get_secret("HR_EMAIL", "hr@example.com")
+HR_EMAIL  = get_secret("HR_EMAIL", "hr@example.com")
 
 SMTP_HOST = get_secret("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(get_secret("SMTP_PORT", "465"))  # SSL port
+SMTP_PORT = int(get_secret("SMTP_PORT", "465"))  # SSL by default
 SMTP_USER = get_secret("SMTP_USER", "")
 SMTP_PASS = get_secret("SMTP_PASS", "")
 
 FROM_NAME  = get_secret("FROM_NAME", "Recruiting Team")
 FROM_EMAIL = get_secret("FROM_EMAIL", SMTP_USER or "no-reply@example.com")
-
-SAVE_DIR = pathlib.Path(get_secret("SAVE_DIR", "submissions"))
-SAVE_DIR.mkdir(parents=True, exist_ok=True)
-CSV_PATH = SAVE_DIR / "applications.csv"
 
 # =============================
 # Utilities
@@ -45,55 +39,25 @@ EMAIL_REGEX = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 def is_email(s: str) -> bool:
     return bool(EMAIL_REGEX.match((s or "").strip()))
 
-def sanitize_filename(s: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", (s or "").strip())[:80]
-
 def create_app_id() -> str:
     return f"APP-{int(time.time())}"
 
-def write_csv_header_if_needed(path: pathlib.Path):
-    if not path.exists():
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "app_id", "timestamp_iso", "full_name", "email", "phone",
-                "position", "years_experience", "expected_salary", "location",
-                "linkedin", "cover_letter",
-                "referred", "ref_name", "ref_emp_id", "ref_email",
-                "resume_filename"
-            ])
+def _mime_from_filename(filename: str) -> Tuple[str, str]:
+    """Return (maintype, subtype) guessed from filename."""
+    guessed, _ = mimetypes.guess_type(filename)
+    if not guessed:
+        return ("application", "octet-stream")
+    maintype, subtype = guessed.split("/", 1)
+    return maintype, subtype
 
-def append_application_row(**kwargs):
-    write_csv_header_if_needed(CSV_PATH)
-    with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            kwargs.get("app_id"),
-            kwargs.get("timestamp_iso"),
-            kwargs.get("full_name"),
-            kwargs.get("email"),
-            kwargs.get("phone"),
-            kwargs.get("position"),
-            kwargs.get("years_experience"),
-            kwargs.get("expected_salary"),
-            kwargs.get("location"),
-            kwargs.get("linkedin"),
-            kwargs.get("cover_letter"),
-            kwargs.get("referred"),
-            kwargs.get("ref_name"),
-            kwargs.get("ref_emp_id"),
-            kwargs.get("ref_email"),
-            kwargs.get("resume_filename"),
-        ])
-
-def send_email(subject: str, body: str, to_email: str,
-               attachment: Optional[bytes] = None,
-               attachment_name: Optional[str] = None,
+def send_email(subject: str,
+               body: str,
+               to_email: str,
+               attachments: Optional[List[Tuple[bytes, str]]] = None,  # list of (data, filename)
                reply_to: Optional[str] = None):
+    """Send an email with optional multiple attachments."""
     if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and FROM_EMAIL):
-        raise RuntimeError(
-            "SMTP not configured. Set SMTP_* and FROM_EMAIL in Streamlit Secrets or environment vars."
-        )
+        raise RuntimeError("SMTP not configured. Set SMTP_* and FROM_EMAIL in Secrets/env.")
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -103,31 +67,26 @@ def send_email(subject: str, body: str, to_email: str,
         msg["Reply-To"] = reply_to
     msg.set_content(body)
 
-    if attachment and attachment_name:
-        # Assume PDF for resume
-        msg.add_attachment(attachment, maintype="application", subtype="pdf", filename=attachment_name)
+    if attachments:
+        for data, fname in attachments:
+            maintype, subtype = _mime_from_filename(fname)
+            msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=fname)
 
     with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as smtp:
         smtp.login(SMTP_USER, SMTP_PASS)
         smtp.send_message(msg)
 
 # =============================
-# UI: App layout
+# UI
 # =============================
 st.set_page_config(page_title=APP_TITLE, page_icon="📝", layout="centered")
 st.title(APP_TITLE)
 st.caption("Submit your application below. Fields marked with * are required.")
 
-# --- Referral toggle OUTSIDE the form so it reruns instantly ---
+# Referral toggle OUTSIDE the form for instant show/hide
 st.subheader("Referral")
-st.checkbox(
-    "I was referred by an employee",
-    key="referred_toggle"  # persists in session_state
-)
+st.checkbox("I was referred by an employee", key="referred_toggle")
 
-# =============================
-# The form
-# =============================
 with st.form("job_application_form", clear_on_submit=False):
     st.subheader("Applicant Details")
     col1, col2 = st.columns(2)
@@ -136,19 +95,31 @@ with st.form("job_application_form", clear_on_submit=False):
         email = st.text_input("Email *", key="email")
         phone = st.text_input("Phone *", key="phone")
         position = st.text_input("Position Applying For *", key="position")
-        years_experience = st.number_input("Years of Experience *", min_value=0.0, step=0.1, format="%.g", key="years_experience")
+        years_experience = st.number_input(
+            "Years of Experience *",
+            min_value=0.0,
+            value=0.0,
+            step=0.1,
+            format="%g",          # shows 0 (not 0.0); 1.5 shows as 1.5
+            key="years_experience"
+        )
     with col2:
         expected_salary = st.text_input("Expected Salary (e.g., 120000 or 12 LPA)", key="expected_salary")
         location = st.text_input("Current Location", key="location")
         linkedin = st.text_input("LinkedIn URL", key="linkedin")
-        cover_letter = st.text_area("Cover Letter / Notes", key="cover_letter")
+        notes = st.text_area("Notes", key="notes")
 
-    st.subheader("Resume")
+    st.subheader("Resume (PDF) *")
     resume_file = st.file_uploader("Upload Resume (PDF only) *", type=["pdf"], key="resume_file")
 
-    # Read referral toggle from session_state
-    referred = st.session_state.get("referred_toggle", False)
+    st.subheader("Cover Letter (optional)")
+    cover_letter_file = st.file_uploader(
+        "Upload Cover Letter (PDF, DOC, or DOCX)",
+        type=["pdf", "doc", "docx"],
+        key="cover_letter_file"
+    )
 
+    referred = st.session_state.get("referred_toggle", False)
     ref_name = ref_emp_id = ref_email = ""
     if referred:
         st.markdown("**Referrer details**")
@@ -162,21 +133,24 @@ with st.form("job_application_form", clear_on_submit=False):
     submitted = st.form_submit_button("Submit Application")
 
 # =============================
-# Submission handling
+# Submission
 # =============================
 if submitted:
     errors = []
 
-    # Pull values safely from session_state (the form widgets wrote there)
+    # Read inputs
     full_name = (st.session_state.get("full_name") or "").strip()
     email = (st.session_state.get("email") or "").strip()
     phone = (st.session_state.get("phone") or "").strip()
     position = (st.session_state.get("position") or "").strip()
-    years_experience = st.session_state.get("years_experience", None)
+
+    years_experience = float(st.session_state.get("years_experience", 0.0))
+    years_experience = max(0.0, round(years_experience, 1))  # normalize to 1 decimal
+
     expected_salary = (st.session_state.get("expected_salary") or "").strip()
     location = (st.session_state.get("location") or "").strip()
     linkedin = (st.session_state.get("linkedin") or "").strip()
-    cover_letter = (st.session_state.get("cover_letter") or "").strip()
+    notes = (st.session_state.get("notes") or "").strip()
     consent = bool(st.session_state.get("consent", False))
 
     referred = bool(st.session_state.get("referred_toggle", False))
@@ -184,21 +158,28 @@ if submitted:
     ref_emp_id = (st.session_state.get("ref_emp_id") or "").strip() if referred else ""
     ref_email = (st.session_state.get("ref_email") or "").strip() if referred else ""
 
-    # Validate required fields
+    # Validate requireds
     if not full_name:
         errors.append("Full Name is required.")
     if not is_email(email):
         errors.append("Valid Email is required.")
     if not position:
         errors.append("Position is required.")
-    if years_experience is None:
-        errors.append("Years of Experience is required.")
-    if not resume_file:
+    if resume_file is None:
         errors.append("Resume PDF is required.")
     if not consent:
         errors.append("Consent is required to submit the application.")
 
-    # Referral validations if selected
+    # File validations
+    if resume_file and resume_file.type != "application/pdf":
+        errors.append("Resume must be a PDF file.")
+    if cover_letter_file:
+        # basic extension check (Streamlit already restricts types)
+        cl_name = cover_letter_file.name.lower()
+        if not (cl_name.endswith(".pdf") or cl_name.endswith(".doc") or cl_name.endswith(".docx")):
+            errors.append("Cover Letter must be a PDF, DOC, or DOCX file.")
+
+    # Referral validations
     if referred:
         if not ref_name:
             errors.append("Referrer Name is required.")
@@ -207,57 +188,25 @@ if submitted:
         if not is_email(ref_email):
             errors.append("Valid Referrer Email is required.")
 
-    # Validate resume type
-    if resume_file and resume_file.type != "application/pdf":
-        errors.append("Resume must be a PDF file.")
-
     if errors:
         for e in errors:
             st.error(e)
         st.stop()
 
-    # Persist resume
-    timestamp = datetime.utcnow()
+    # Build IDs and read files (no saving to disk)
     app_id = create_app_id()
-    safe_name = sanitize_filename(full_name or "applicant")
-    resume_name = f"{app_id}_{safe_name}.pdf"
-    resume_path = SAVE_DIR / resume_name
+    resume_bytes = resume_file.read()
+    resume_name = f"{app_id}_resume.pdf"
 
-    try:
-        resume_bytes = resume_file.read()
-        with open(resume_path, "wb") as f:
-            f.write(resume_bytes)
-    except Exception as ex:
-        st.error(f"Failed to save resume: {ex}")
-        st.stop()
+    cover_bytes = None
+    cover_name = None
+    if cover_letter_file:
+        cover_bytes = cover_letter_file.read()
+        # Keep original extension for correct MIME
+        ext = os.path.splitext(cover_letter_file.name)[1].lower() or ".pdf"
+        cover_name = f"{app_id}_cover_letter{ext}"
 
-    # Save CSV record
-    record = {
-        "app_id": app_id,
-        "timestamp_iso": timestamp.isoformat() + "Z",
-        "full_name": full_name,
-        "email": email,
-        "phone": phone,
-        "position": position,
-        "years_experience": years_experience,
-        "expected_salary": expected_salary,
-        "location": location,
-        "linkedin": linkedin,
-        "cover_letter": cover_letter,
-        "referred": "Yes" if referred else "No",
-        "ref_name": ref_name,
-        "ref_emp_id": ref_emp_id,
-        "ref_email": ref_email,
-        "resume_filename": resume_name,
-    }
-
-    try:
-        append_application_row(**record)
-    except Exception as ex:
-        st.error(f"Failed to save application record: {ex}")
-        st.stop()
-
-    # Prepare email bodies
+    # Email texts
     applicant_subject = f"Application Submitted Successfully — {app_id}"
     applicant_body = (
         f"Hi {full_name},\n\n"
@@ -266,10 +215,9 @@ if submitted:
         f"Best,\n{FROM_NAME}"
     )
 
-    # HR body (with details)
-    hr_body_lines = [
+    hr_lines = [
         f"Application ID: {app_id}",
-        f"Submitted (UTC): {record['timestamp_iso']}",
+        f"Submitted (UTC): {datetime.utcnow().isoformat()}Z",
         f"Name: {full_name}",
         f"Email: {email}",
         f"Phone: {phone}",
@@ -279,19 +227,20 @@ if submitted:
         f"Location: {location}",
         f"LinkedIn: {linkedin}",
         f"Referred: {'Yes' if referred else 'No'}",
+        f"Cover Letter Uploaded: {'Yes' if cover_bytes else 'No'}",
     ]
     if referred:
-        hr_body_lines += [
+        hr_lines += [
             f"Referrer Name: {ref_name}",
             f"Referrer Emp ID: {ref_emp_id}",
             f"Referrer Email: {ref_email}",
         ]
-    if cover_letter:
-        hr_body_lines += ["", "Cover Letter:", cover_letter]
-    hr_subject = f"[New Application] {full_name} — {position} — {app_id}"
-    hr_body = "\n".join(hr_body_lines)
+    if notes:
+        hr_lines += ["", "Notes:", notes]
 
-    # Referrer email (if provided)
+    hr_subject = f"[New Application] {full_name} — {position} — {app_id}"
+    hr_body = "\n".join(hr_lines)
+
     ref_subject = f"You Referred an Applicant — {full_name} for {position} ({app_id})"
     ref_body = (
         f"Hello {ref_name},\n\n"
@@ -300,13 +249,18 @@ if submitted:
         f"Best,\n{FROM_NAME}"
     )
 
-    # Send emails
+    # Send emails (HR gets resume + optional cover letter attachments)
     try:
-        # Applicant confirmation (no attachment)
+        # Applicant confirmation
         send_email(applicant_subject, applicant_body, email, reply_to=HR_EMAIL)
 
-        # HR notification (attach resume)
-        send_email(hr_subject, hr_body, HR_EMAIL, attachment=resume_bytes, attachment_name=resume_name)
+        # Build HR attachments
+        hr_attachments: List[Tuple[bytes, str]] = [(resume_bytes, resume_name)]
+        if cover_bytes and cover_name:
+            hr_attachments.append((cover_bytes, cover_name))
+
+        # HR notification
+        send_email(hr_subject, hr_body, HR_EMAIL, attachments=hr_attachments)
 
         # Referrer (optional)
         if referred and ref_email:
@@ -316,14 +270,24 @@ if submitted:
         st.info("A confirmation email has been sent to you. HR has also been notified."
                 + (" The referring employee was notified as well." if referred else ""))
 
-        # Allow applicant to download the saved resume copy (local convenience)
-        st.download_button("Download the saved resume copy",
-                           data=resume_bytes, file_name=resume_name, mime="application/pdf")
-
-        # Show a brief receipt (without local filename)
-        with st.expander("View submission receipt"):
-            receipt = {k: v for k, v in record.items() if k != "resume_filename"}
-            st.json(receipt)
+        with st.expander("View submission summary"):
+            st.json({
+                "app_id": app_id,
+                "full_name": full_name,
+                "email": email,
+                "phone": phone,
+                "position": position,
+                "years_experience": years_experience,
+                "expected_salary": expected_salary,
+                "location": location,
+                "linkedin": linkedin,
+                "referred": "Yes" if referred else "No",
+                "ref_name": ref_name,
+                "ref_emp_id": ref_emp_id,
+                "ref_email": ref_email,
+                "cover_letter_uploaded": "Yes" if cover_bytes else "No",
+                "notes_present": "Yes" if notes else "No"
+            })
 
     except Exception as ex:
         st.error(f"Emails could not be sent: {ex}")
