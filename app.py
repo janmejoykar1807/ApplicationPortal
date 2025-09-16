@@ -136,7 +136,7 @@ with st.form("job_application_form", clear_on_submit=False):
         email = st.text_input("Email *", key="email")
         phone = st.text_input("Phone *", key="phone")
         position = st.text_input("Position Applying For *", key="position")
-        years_experience = st.number_input("Years of Experience *", min_value=0, step=0.1, key="years_experience")
+        years_experience = st.number_input("Years of Experience *", min_value=0.0, step=0.1, key="years_experience")
     with col2:
         expected_salary = st.text_input("Expected Salary (e.g., 120000 or 12 LPA)", key="expected_salary")
         location = st.text_input("Current Location", key="location")
